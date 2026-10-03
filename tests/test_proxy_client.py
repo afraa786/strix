@@ -9,10 +9,12 @@ call at a time against the shared client.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from strix.runtime.caido_handle import CaidoBootstrapHandle
 from strix.tools.proxy import caido_api, tools
 
 
@@ -140,17 +142,113 @@ async def test_host_call_serializes_concurrent_calls() -> None:
     assert state["max"] == 1
 
 
+def _headers_named(raw: bytes, name: str) -> list[str]:
+    head = raw.decode("utf-8").split("\r\n\r\n", 1)[0]
+    return [
+        line.split(":", 1)[1].strip()
+        for line in head.split("\r\n")[1:]
+        if line.split(":", 1)[0].strip().lower() == name.lower()
+    ]
+
+
+def test_build_raw_request_recomputes_content_length_for_modified_body() -> None:
+    # The captured request declared Content-Length: 12 (original body); the
+    # replayed body is longer. The emitted request must carry exactly one
+    # Content-Length equal to the ACTUAL body length, or the target truncates
+    # the modified payload (or the connection desyncs).
+    body = '{"user":"a\' OR 1=1 -- injected long payload"}'
+    _conn, raw = caido_api.build_raw_request(
+        method="POST",
+        url="https://example.com/login",
+        headers={"content-length": "12", "Content-Type": "application/json"},
+        body=body,
+    )
+    sent_body = raw.decode("utf-8").split("\r\n\r\n", 1)[1]
+    assert sent_body == body
+    assert _headers_named(raw, "Content-Length") == [str(len(body.encode("utf-8")))]
+
+
+def test_build_raw_request_drops_transfer_encoding_for_modified_body() -> None:
+    body = '{"user":"updated"}'
+    _conn, raw = caido_api.build_raw_request(
+        method="POST",
+        url="https://example.com/login",
+        headers={
+            "tRaNsFeR-EnCoDiNg": "chunked",
+            "Content-Length": "7",
+            "Content-Type": "application/json",
+        },
+        body=body,
+    )
+    assert _headers_named(raw, "Transfer-Encoding") == []
+    assert _headers_named(raw, "Content-Length") == [str(len(body.encode("utf-8")))]
+
+
+def test_build_raw_request_drops_stale_content_length_for_empty_body() -> None:
+    # A body cleared to empty must not keep the inherited (non-zero) length.
+    _conn, raw = caido_api.build_raw_request(
+        method="POST",
+        url="https://example.com/x",
+        headers={"Content-Length": "12"},
+        body="",
+    )
+    assert _headers_named(raw, "Content-Length") == []
+
+
 class _Ctx:
     def __init__(self, context: Any) -> None:
         self.context = context
 
 
-def test_ctx_client_returns_client_when_present() -> None:
+async def test_ctx_client_returns_client_when_present() -> None:
     client = _FakeClient("host")
-    got = tools._ctx_client(cast("Any", _Ctx({"caido_client": client})))
+    got = await tools._ctx_client(cast("Any", _Ctx({"caido_client": client})))
     assert got is client
 
 
-def test_ctx_client_returns_none_without_client() -> None:
-    assert tools._ctx_client(cast("Any", _Ctx({}))) is None
-    assert tools._ctx_client(cast("Any", _Ctx(None))) is None
+async def test_ctx_client_returns_none_without_client() -> None:
+    assert await tools._ctx_client(cast("Any", _Ctx({}))) is None
+    assert await tools._ctx_client(cast("Any", _Ctx(None))) is None
+
+
+async def test_ctx_client_resolves_bootstrap_handle() -> None:
+    client = _FakeClient("host")
+
+    async def _bootstrap() -> Any:
+        return client
+
+    handle = CaidoBootstrapHandle(asyncio.ensure_future(_bootstrap()))
+    got = await tools._ctx_client(cast("Any", _Ctx({"caido_client": handle})))
+    assert got is client
+
+
+async def test_ctx_client_degrades_when_bootstrap_failed() -> None:
+    async def _bootstrap() -> Any:
+        raise RuntimeError("caido never came up")
+
+    handle = CaidoBootstrapHandle(asyncio.ensure_future(_bootstrap()))
+    assert await tools._ctx_client(cast("Any", _Ctx({"caido_client": handle}))) is None
+
+
+async def test_existing_request_ids_queries_current_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient("host")
+    looked_up: list[str] = []
+
+    async def get_request_with_client(passed_client: Any, request_id: str) -> Any:
+        assert passed_client is client
+        looked_up.append(request_id)
+        if request_id == "1042":
+            return SimpleNamespace(request=SimpleNamespace(id="1042"))
+        return None
+
+    monkeypatch.setattr(caido_api, "get_request_with_client", get_request_with_client)
+
+    existing = await tools.existing_request_ids(
+        cast("Any", _Ctx({"caido_client": client})),
+        ["1042", "1088"],
+    )
+
+    assert existing == {"1042"}
+    assert looked_up == ["1042", "1088"]

@@ -1,6 +1,6 @@
 ---
 name: weak-password-detection
-description: Weak password detection, credential stuffing, and brute-force testing using common passwords, system-generated credentials, and tooling like Hydra
+description: Weak password detection, credential stuffing, and brute-force testing using common passwords, system-generated credentials, and HTTP fuzzing / NSE brute-force tooling
 ---
 
 # Weak Password Detection / Credential Brute-Force
@@ -49,12 +49,14 @@ Weak or default credentials remain one of the most prevalent and high-impact vul
 
 ### Weak Password Policies
 
-- No minimum length or complexity requirements
+- Insufficient minimum length for the authentication mode; NIST SP 800-63B-4 requires 15 characters for single-factor passwords and permits a minimum of eight when the password is only used as part of MFA
 - Allowing common passwords: `password`, `123456`, `qwerty`, `admin`, `letmein`
 - Not checking against breached password databases (Have I Been Pwned)
 - Case-insensitive password storage
-- No password history enforcement
+- Forced periodic changes without compromise evidence, which encourage predictable password changes
 - Excessively short maximum length (indicates plaintext or weak hashing)
+
+NIST SP 800-63B-4 recommends allowing a maximum of at least 64 characters and requires screening against common/compromised passwords and checking the entire password without truncation. Missing character-class rules is not a weakness: the standard prohibits mandatory composition rules and periodic resets without evidence of compromise. Apply these requirements when that standard is the target's policy baseline ([NIST SP 800-63B-4](https://pages.nist.gov/800-63-4/sp800-63b.html#passwordver)).
 
 ### Default and Hardcoded Credentials
 
@@ -98,7 +100,7 @@ Weak or default credentials remain one of the most prevalent and high-impact vul
   - Season + year patterns: `Summer2025!`, `Winter2026@`
   - Keyboard walks and leet speak variations
   - Previously breached passwords for the target domain
-- Cewl: `cewl -d 3 -m 5 -w custom.txt https://target.com` to generate from website content
+- Scrape the target site to build a content-derived wordlist (e.g. a small custom Python crawler that harvests unique words)
 
 ### Credential Stuffing Workflows
 
@@ -123,37 +125,25 @@ Weak or default credentials remain one of the most prevalent and high-impact vul
 
 ### Service-Level Brute-Force
 
-- SSH: `hydra -l admin -P passwords.txt ssh://target.com`
-- FTP: `hydra -L users.txt -P passwords.txt ftp://target.com`
-- RDP: `hydra -l administrator -P passwords.txt rdp://target.com`
-- SMB: `hydra -L users.txt -P passwords.txt smb://target.com`
-- Database: MySQL, PostgreSQL, MongoDB, Redis with weak credentials
-- API endpoints: `ffuf` or custom scripts for HTTP-based brute-force
+- HTTP login endpoints: `ffuf` or custom scripts (see Tooling)
+- SSH/FTP/SMB/Telnet and other services: `nmap` NSE `*-brute` scripts, e.g. `nmap -p 22 --script ssh-brute --script-args userdb=users.txt,passdb=passwords.txt target.com`
+- Databases (MySQL, PostgreSQL, MongoDB, Redis): weak/default credentials via the matching NSE brute script (`mysql-brute`, `pgsql-brute`, `mongodb-brute`, `redis-brute`) or a custom client script
+- Any protocol lacking a ready script: custom Python
 
 ## Tooling
 
-### Hydra (Primary Tool)
-
-- HTTP POST form brute-force:
-  `hydra -l admin -P /usr/share/wordlists/rockyou.txt target.com http-post-form "/login:username=^USER^&password=^PASS^:Invalid credentials"`
-- Basic Auth:
-  `hydra -L users.txt -P passwords.txt target.com http-get -s 8080 /admin`
-- SSH:
-  `hydra -l root -P passwords.txt -t 4 ssh://target.com`
-- FTP:
-  `hydra -L users.txt -P passwords.txt ftp://target.com`
-- Custom headers and cookies:
-  `hydra ... http-post-form "/api/login:json={\"user\":\"^USER^\",\"pass\":\"^PASS^\"}:F=401"`
-
-### ffuf (HTTP Fuzzing)
+### ffuf (primary for web logins)
 
 - Login brute-force with multiple users and passwords:
   `ffuf -w users.txt:USER -w passwords.txt:PASS -u https://target.com/login -X POST -d "username=USER&password=PASS" -fr "Invalid"`
+- JSON body / custom headers via `-H` and a JSON `-d` payload
 - Filter by response size, status code, or regex to identify successes
 
-### Patator (Versatile Brute-Force)
+### nmap NSE (service brute-force)
 
-- `patator http_fuzz url=https://target.com/login method=POST body='username=FILE0&password=FILE1' 0=user.txt 1=pass.txt -x ignore:fgrep='Invalid'`
+- `*-brute` scripts cover many non-HTTP services:
+  `nmap -p 22 --script ssh-brute --script-args userdb=users.txt,passdb=passwords.txt target.com`
+- Available scripts include `ssh-brute`, `ftp-brute`, `smb-brute`, `telnet-brute`, `mysql-brute`, `pgsql-brute`, `mongodb-brute`, `redis-brute`, `http-brute`, `http-form-brute`.
 
 ### Custom Python Scripts
 
@@ -163,10 +153,10 @@ Weak or default credentials remain one of the most prevalent and high-impact vul
 
 ### Wordlists
 
-- `/usr/share/wordlists/rockyou.txt` (common passwords)
-- `/usr/share/seclists/Passwords/` (organized by category)
-- `/usr/share/seclists/Passwords/Default-Credentials/` (vendor defaults)
-- Custom lists from Cewl, CeWL, or target-specific scraping
+No password wordlists ship in the sandbox by default — download what you need into `/home/pentester/tools/wordlists` at runtime:
+- Common passwords (e.g. `rockyou.txt`) from its upstream source
+- SecLists `Passwords/` and `Passwords/Default-Credentials/` (vendor defaults) from https://github.com/danielmiessler/SecLists
+- Custom lists from target-specific scraping
 - Breach compilation subsets filtered by target relevance
 
 ## Validation
@@ -203,8 +193,8 @@ Weak or default credentials remain one of the most prevalent and high-impact vul
 5. Test for password spraying (one password, many users) before targeted brute-force
 6. Check for concurrent session limits; successful logins may kick out legitimate users
 7. GraphQL batching can test multiple credentials in a single request, bypassing per-request limits
-8. Document the password policy and recommend minimum standards (length, complexity, breach checking)
-9. When Hydra is unavailable, use ffuf or custom scripts with equivalent logic
+8. Document the password policy and recommend minimum standards (length appropriate to single-factor/MFA use, breach checking, and resistance to online guessing)
+9. For web logins prefer `ffuf`; for other services use `nmap` NSE `*-brute` scripts or custom scripts with equivalent logic
 10. Combine with MFA testing: weak passwords plus missing MFA is a critical finding
 
 ## Summary

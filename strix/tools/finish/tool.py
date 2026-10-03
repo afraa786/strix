@@ -22,6 +22,7 @@ def _do_finish(
     methodology: str,
     technical_analysis: str,
     recommendations: str,
+    agent_graph: dict[str, Any],
 ) -> dict[str, Any]:
     if parent_id is not None:
         return {
@@ -63,6 +64,7 @@ def _do_finish(
             recommendations=recommendations.strip(),
         )
         vuln_count = len(report_state.vulnerability_reports)
+        coverage_summary = _coverage_summary(agent_graph)
     except (ImportError, AttributeError) as e:
         logger.exception("finish_scan persistence failed")
         return {"success": False, "error": f"Failed to complete scan: {e!s}"}
@@ -71,12 +73,66 @@ def _do_finish(
             "finish_scan: completed scan with %d vulnerability report(s)",
             vuln_count,
         )
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "scan_completed": True,
             "message": "Scan completed successfully",
             "vulnerabilities_found": vuln_count,
         }
+        result.update(coverage_summary)
+        return result
+
+
+def _coverage_summary(agent_graph: dict[str, Any]) -> dict[str, Any]:
+    """Coverage counts, unresolved surfaces, and gaps the runtime can see.
+
+    The gap list is derived from the agent graph rather than from the ledger,
+    so it catches the failure the ledger cannot: a risk class an agent was
+    equipped for and never accounted for. Surfacing it here — in the response
+    to the call that ends the scan — is the last point at which the root agent
+    can still dispatch work or record the class as unresolved instead of
+    letting the report imply it was clean.
+    """
+    from strix.report.coverage import agents_from_graph, skill_coverage_gaps
+    from strix.tools.coverage.tools import get_coverage_entries, outcome_counts
+
+    entries = get_coverage_entries()
+    if not entries:
+        return {
+            "coverage_recorded": 0,
+            "coverage_warning": (
+                "No coverage was recorded for this scan. The report cannot show which "
+                "surfaces were reviewed and cleared — only what was found. Use "
+                "record_coverage during testing so future scans can report negative space."
+            ),
+        }
+
+    counts = outcome_counts()
+    summary: dict[str, Any] = {
+        "coverage_recorded": len(entries),
+        "coverage_outcomes": counts,
+    }
+    unresolved = [e for e in entries if e.get("outcome") == "needs_follow_up"]
+    if unresolved:
+        summary["coverage_warning"] = (
+            f"{len(unresolved)} surface(s) closed as 'needs_follow_up' and remain "
+            "unresolved. These should be represented in the report as areas requiring "
+            "further review rather than omitted."
+        )
+        summary["unresolved_surfaces"] = [
+            {"surface": e.get("surface", ""), "risk_area": e.get("risk_area", "")}
+            for e in unresolved
+        ]
+
+    gaps = skill_coverage_gaps(entries, agents_from_graph(agent_graph))
+    if gaps:
+        summary["coverage_gaps"] = [gap["detail"] for gap in gaps]
+        summary["coverage_gap_warning"] = (
+            f"{len(gaps)} risk class(es) assigned to agents have no coverage entry and "
+            "will be published as unexamined. Record them (or a needs_follow_up row) "
+            "before the report goes out."
+        )
+    return summary
 
 
 @function_tool(timeout=60)
@@ -101,7 +157,7 @@ async def finish_scan(
     execution stops. There is no draft mode and no second chance: never
     submit placeholder, provisional, or "checking if done" text in any
     field, and never call ``finish_scan`` to poll whether subagents are
-    done (use ``view_agent_graph`` / ``wait_for_message`` for that).
+    done (use ``view_agent_graph`` / ``wait_for_agents`` for that).
     Call it exactly ONCE, only when every field holds genuine, finished
     assessment prose.
 
@@ -111,17 +167,21 @@ async def finish_scan(
        summary. If ANY agent is in ``running`` / ``waiting`` state,
        you MUST NOT call ``finish_scan`` yet —
        wrap them up first via ``send_message_to_agent`` (ask them to
-       finish), ``wait_for_message`` (block until their report
+       finish), ``wait_for_agents`` (block until their report
        arrives), or ``stop_agent`` (graceful cancel). Only ``completed``
        / ``crashed`` / ``stopped`` agents are safe to leave behind.
        Calling ``finish_scan`` while children are alive orphans their
        work and produces an incomplete report.
-    2. All vulnerabilities you found are filed via
-       ``create_vulnerability_report`` — or, for known-CVE dependency
-       findings, ``create_dependency_report`` (un-reported findings are
-       not tracked and not credited). A dependency CVE already filed via
-       ``create_dependency_report`` counts as reported; it does NOT need
-       re-filing here and does NOT block finishing.
+    2. It's a good idea to call ``list_reports`` before finishing to
+       review every finding filed in this scan (use ``get_report`` for
+       full detail on any of them) so your ``executive_summary`` /
+       ``technical_analysis`` are grounded in what was actually reported
+       — don't invent or omit findings. All vulnerabilities you found are
+       filed via ``create_vulnerability_report`` — or, for known-CVE
+       dependency findings, ``create_dependency_report`` (un-reported
+       findings are not tracked and not credited). A dependency CVE
+       already filed via ``create_dependency_report`` counts as reported;
+       it does NOT need re-filing here and does NOT block finishing.
     3. Don't double-report — one report per distinct vulnerability.
     4. **Attack-chaining gate.** Do NOT finish until you have genuinely
        considered chaining the confirmed findings into higher-impact,
@@ -137,6 +197,14 @@ async def finish_scan(
        chain after a serious attempt is acceptable; skipping the
        chaining reasoning, or ignoring a plausibly-related combination,
        is not.
+    5. **Coverage reconciliation.** Call ``list_coverage`` and check
+       what was actually assessed against the surfaces you enumerated
+       during reconnaissance. Every surface you dispatched work on
+       should have a coverage entry; anything still open should be a
+       ``needs_follow_up`` row, not a silent omission. If a significant
+       surface has no entry at all, dispatch an agent to cover it or
+       record it as ``needs_follow_up`` before finishing. The response
+       from this tool reports coverage counts and any unresolved rows.
 
     **Calling this multiple times overwrites the previous report.**
     Make the single call comprehensive.
@@ -249,6 +317,8 @@ async def finish_scan(
     parent_id = inner.get("parent_id")
     if coordinator is not None and parent_id is None and me is not None:
         active_agents = await coordinator.active_agents_except(me)
+        if active_agents and coordinator.reserve_stopped:
+            active_agents = []
     else:
         active_agents = []
 
@@ -274,6 +344,7 @@ async def finish_scan(
         methodology=methodology,
         technical_analysis=technical_analysis,
         recommendations=recommendations,
+        agent_graph=await coordinator.snapshot() if coordinator is not None else {},
     )
     if (
         result.get("success")

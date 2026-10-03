@@ -10,20 +10,16 @@ import urllib.request
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-from caido_sdk_client import Client, TokenAuthOptions
-from caido_sdk_client.types import (
-    ConnectionInfoInput,
-    CreateScopeOptions,
-    ReplaySendOptions,
-    RequestGetOptions,
-    UpdateScopeOptions,
-)
 
-
+# The generated Caido GraphQL schema module is slow to import and is only needed
+# once a proxy tool actually runs, so the SDK is imported on first use rather
+# than at module scope, which would put it on every launch's critical path.
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from caido_sdk_client import Client
     from caido_sdk_client import Client as CaidoClient
+    from caido_sdk_client.types import ConnectionInfoInput
 
 
 RequestPart = Literal["request", "response"]
@@ -85,6 +81,8 @@ def _login_as_guest() -> str:
 
 
 async def _new_client() -> Client:
+    from caido_sdk_client import Client, TokenAuthOptions
+
     token = await asyncio.to_thread(_login_as_guest)
     client = Client(caido_url(), auth=TokenAuthOptions(token=token))
     await client.connect()
@@ -163,8 +161,13 @@ async def get_request_with_client(
     # Passing False for either causes pydantic validation to fail with
     # "Field required" on the missing raw field. Always request both —
     # the caller picks which one to surface via ``part``.
+    from caido_sdk_client.types import RequestGetOptions
+
     opts = RequestGetOptions(request_raw=True, response_raw=True)
     return await client.request.get(request_id, opts)
+
+
+_FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
 
 
 def build_raw_request(
@@ -186,9 +189,24 @@ def build_raw_request(
 
     final_headers = {**headers}
     final_headers.setdefault("Host", parsed.netloc)
-    final_headers.setdefault("User-Agent", "strix")
-    if body and "Content-Length" not in {k.title() for k in final_headers}:
+    final_headers.setdefault(
+        "User-Agent",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    )
+    # Framing headers inherited from the captured request describe the ORIGINAL
+    # body; once the body is modified for replay they are stale. We always send a
+    # plain (non-chunked) body with an explicit Content-Length, so drop any
+    # inherited Content-Length AND Transfer-Encoding (case-insensitively) and
+    # recompute the length from the body actually being sent. This keeps the two
+    # framing mechanisms from conflicting (RFC 7230 3.3.3: a leftover
+    # Transfer-Encoding would make the target ignore Content-Length and try to
+    # parse the body as chunked), so the replay is never desynced.
+    final_headers = {k: v for k, v in final_headers.items() if k.lower() not in _FRAMING_HEADERS}
+    if body:
         final_headers["Content-Length"] = str(len(body.encode("utf-8")))
+
+    from caido_sdk_client.types import ConnectionInfoInput
 
     lines = [f"{method.upper()} {path} HTTP/1.1"]
     lines.extend(f"{k}: {v}" for k, v in final_headers.items())
@@ -318,6 +336,8 @@ async def replay_send_raw(
     raw: bytes,
     connection: ConnectionInfoInput,
 ) -> dict[str, Any]:
+    from caido_sdk_client.types import ReplaySendOptions
+
     started = time.time()
     # Create an empty replay session, then dispatch via ``send()``.
     # Passing ``CreateReplaySessionFromRaw`` here would also seed a stored
@@ -375,6 +395,8 @@ async def scope_create(
     allowlist: list[str] | None = None,
     denylist: list[str] | None = None,
 ) -> Any:
+    from caido_sdk_client.types import CreateScopeOptions
+
     return await client.scope.create(
         CreateScopeOptions(
             name=name,
@@ -392,6 +414,8 @@ async def scope_update(
     allowlist: list[str] | None = None,
     denylist: list[str] | None = None,
 ) -> Any:
+    from caido_sdk_client.types import UpdateScopeOptions
+
     return await client.scope.update(
         scope_id,
         UpdateScopeOptions(

@@ -7,25 +7,61 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-from agents.model_settings import ModelSettings
 from agents.models.interface import ModelTracing
 from openai.types.responses import ResponseOutputMessage
 
 from strix.config import load_settings
 from strix.config.models import (
-    DEFAULT_MODEL_RETRY,
     StrixProvider,
     configure_sdk_model_defaults,
-    request_timeout_extra_args,
 )
+from strix.core.inputs import make_model_settings
 from strix.report.state import get_global_report_state
 
 
 if TYPE_CHECKING:
     from agents.items import ModelResponse
+    from agents.model_settings import ModelSettings
+    from agents.models.interface import Model
+
+    from strix.config.settings import DedupeSettings
 
 
 logger = logging.getLogger(__name__)
+
+
+def _dedupe_model_settings(
+    dedupe: DedupeSettings, model_name: str, request_timeout: float | None
+) -> ModelSettings:
+    llm = load_settings().llm
+    return make_model_settings(
+        dedupe.reasoning_effort,
+        model_name=model_name,
+        force_required_tool_choice=False,
+        request_timeout=request_timeout,
+        # The main model's headers apply only when dedupe falls back to the main
+        # model; a dedicated dedupe model may route to another provider, which
+        # must never receive the main endpoint's credentials. A dedicated model
+        # gets its own DEDUPE_LLM_EXTRA_HEADERS instead.
+        extra_headers=dedupe.extra_headers if dedupe.model else llm.extra_headers,
+        has_tools=False,
+    )
+
+
+def resolve_dedupe_model(dedupe: DedupeSettings, model_name: str) -> Model:
+    """Resolve the dedupe model, bound to its own endpoint when it has one.
+
+    Credentials can't ride on the request: every model implementation already
+    passes its own ``api_key``/``base_url``, so the same keys in ``extra_args``
+    collide with them and raise before anything is sent. A provider bound to the
+    dedupe endpoint keeps it apart from the main model's process-wide defaults.
+    """
+    api_key = (dedupe.api_key or "").strip() if dedupe.model else ""
+    api_base = (dedupe.api_base or "").strip() if dedupe.model else ""
+    if not (api_key or api_base):
+        return StrixProvider().get_model(model_name)
+    return StrixProvider(api_key=api_key or None, base_url=api_base or None).get_model(model_name)
+
 
 DEDUPE_SYSTEM_PROMPT = """You are an expert vulnerability report deduplication judge.
 Your task is to determine if a candidate vulnerability report describes the SAME vulnerability
@@ -147,6 +183,24 @@ def _dependency_identity(report: dict[str, Any]) -> tuple[str, str, str] | None:
     return cve, ecosystem, package_name
 
 
+def _manifest_path(report: dict[str, Any]) -> str:
+    metadata = report.get("dependency_metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("manifest_path") or "").strip()
+
+
+def _distinct_manifest_paths(candidate: dict[str, Any], report: dict[str, Any]) -> bool:
+    """Same CVE/package observed in two different manifests is two findings.
+
+    Only applies when both sides carry a manifest_path; a missing path keeps
+    the legacy CVE/package/ecosystem identity.
+    """
+    candidate_path = _manifest_path(candidate)
+    report_path = _manifest_path(report)
+    return bool(candidate_path and report_path and candidate_path != report_path)
+
+
 def _report_cve(report: dict[str, Any]) -> str:
     return str(report.get("cve") or "").strip().upper()
 
@@ -191,6 +245,8 @@ def _check_dependency_duplicate(
         if report_identity is not None:
             report_cve, report_ecosystem, report_package_name = report_identity
             if (report_cve, report_package_name) != (cve, package_name):
+                continue
+            if _distinct_manifest_paths(candidate, report):
                 continue
             if report_ecosystem == ecosystem:
                 return {
@@ -292,13 +348,14 @@ async def check_duplicate(
 
     try:
         settings = load_settings()
-        model_name = settings.llm.model
+        dedupe = settings.dedupe
+        model_name = (dedupe.model or "").strip() or settings.llm.model
         if not model_name:
             return {
                 "is_duplicate": False,
                 "duplicate_id": "",
                 "confidence": 0.0,
-                "reason": "STRIX_LLM not configured; skipping dedupe check",
+                "reason": "No LLM model configured; skipping dedupe check",
             }
 
         candidate_cleaned = _prepare_report_for_comparison(candidate)
@@ -313,15 +370,11 @@ async def check_duplicate(
 
         configure_sdk_model_defaults(settings)
         resolved_model = model_name.strip()
-        model = StrixProvider().get_model(resolved_model)
+        model = resolve_dedupe_model(dedupe, resolved_model)
         response = await model.get_response(
             system_instructions=DEDUPE_SYSTEM_PROMPT,
             input=user_msg,
-            model_settings=ModelSettings(
-                retry=DEFAULT_MODEL_RETRY,
-                include_usage=True,
-                extra_args=request_timeout_extra_args(settings.llm.timeout),
-            ),
+            model_settings=_dedupe_model_settings(dedupe, resolved_model, settings.llm.timeout),
             tools=[],
             output_schema=None,
             handoffs=[],
